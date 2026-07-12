@@ -1,0 +1,4 @@
+[tools]
+arduino-cli = "1"
+python = "3.12"
+uv = "0.11"
