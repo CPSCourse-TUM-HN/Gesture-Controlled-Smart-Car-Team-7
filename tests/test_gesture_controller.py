@@ -4,10 +4,13 @@ import unittest
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from io import StringIO
-from unittest.mock import patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+from tools.camera_support import CameraInitializationError
 from tools.controller import CommandSender
-from tools.gesture_controller import GestureState, classify_gesture, send_if_changed
+from tools.gesture_controller import GestureState, classify_gesture, run, send_if_changed
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,17 @@ class FakeConnection:
 
     def flush(self) -> None:
         pass
+
+
+class FakeCapture:
+    def __init__(self) -> None:
+        self.released = False
+
+    def isOpened(self) -> bool:
+        return True
+
+    def release(self) -> None:
+        self.released = True
 
 
 def hand_with(index_tip: Point, folded: bool = True) -> list[Point]:
@@ -214,6 +228,36 @@ class SerialCommandTests(unittest.TestCase):
             [call.args[1] for call in send.call_args_list],
             ["F", "S", "B"],
         )
+
+
+class GestureControllerStartupTests(unittest.TestCase):
+    def test_tracker_startup_error_releases_camera(self) -> None:
+        capture = FakeCapture()
+        cv2 = SimpleNamespace(VideoCapture=Mock(return_value=capture))
+
+        with (
+            patch(
+                "tools.gesture_controller.load_camera_dependencies",
+                return_value=(cv2, object()),
+            ),
+            patch(
+                "tools.gesture_controller.create_hand_tracker",
+                side_effect=CameraInitializationError("model path failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                CameraInitializationError,
+                "model path failed",
+            ):
+                run(
+                    port="unused",
+                    camera=0,
+                    lost_timeout=0.5,
+                    preview=False,
+                    config_path=Path("missing-test-config.json"),
+                )
+
+        self.assertTrue(capture.released)
 
 
 if __name__ == "__main__":

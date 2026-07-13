@@ -91,6 +91,27 @@ The provided `.envrc` creates the virtual environment and runs `uv sync --frozen
 uv sync --frozen
 ```
 
+#### Windows camera setup for non-ASCII user profiles
+
+MediaPipe 0.10.21 cannot load its bundled hand-tracking models on Windows when
+its virtual environment is installed below a path containing non-ASCII
+characters. The repository may remain in such a location, but the virtual
+environment used by the camera tools must have an ASCII-only path.
+
+In PowerShell, choose an existing writable ASCII-only parent directory, set
+`UV_PROJECT_ENVIRONMENT`, and recreate the environment there. For example:
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = "D:\venvs\gcsc"
+uv sync --frozen
+uv run gcsc-gesture-configurator
+```
+
+Set the same environment variable in each new PowerShell session before using
+`uv run`, or configure it permanently for the user. The gesture configurator
+and gesture controller now report this condition explicitly instead of
+remaining at the camera startup screen.
+
 ### 2. Install ESP32 support
 
 ```sh

@@ -30,6 +30,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tools.camera_support import (
+    CameraInitializationError,
+    create_hand_tracker,
+    load_camera_dependencies,
+)
 from tools.custom_gestures import (
     CAPTURE_FRAME_COUNT,
     build_template,
@@ -167,31 +172,27 @@ class CameraWorker(QThread):
             return True, 0
 
     def run(self) -> None:
+        capture = None
+        hands = None
         try:
-            import cv2
-            import mediapipe as mp
-        except ImportError as exc:
-            self.error.emit(f"Camera dependencies are unavailable: {exc}")
-            return
+            self._set_status("Loading camera dependencies...")
+            cv2, mp = load_camera_dependencies()
+            self._set_status(f"Opening camera {self._camera_index}...")
+            capture = cv2.VideoCapture(self._camera_index)
+            if not capture.isOpened():
+                raise CameraInitializationError(
+                    f"Could not open camera {self._camera_index}."
+                )
 
-        capture = cv2.VideoCapture(self._camera_index)
-        if not capture.isOpened():
-            self.error.emit(f"Could not open camera {self._camera_index}.")
-            return
-
-        hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.5,
-        )
-        self._set_status("Camera ready.")
-        try:
+            self._set_status("Loading MediaPipe hand tracking...")
+            hands = create_hand_tracker(mp)
+            self._set_status("Camera ready.")
             while not self.isInterruptionRequested():
                 ok, frame = capture.read()
                 if not ok:
-                    self.error.emit("Could not read from the camera.")
-                    return
+                    raise CameraInitializationError(
+                        "Could not read from the camera."
+                    )
 
                 frame = cv2.flip(frame, 1)
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -239,9 +240,21 @@ class CameraWorker(QThread):
                     )
 
                 self.frame_ready.emit(frame.copy())
+        except CameraInitializationError as exc:
+            self.error.emit(str(exc))
+        except Exception as exc:
+            self.error.emit(f"Camera processing stopped unexpectedly: {exc}")
         finally:
-            hands.close()
-            capture.release()
+            if hands is not None:
+                try:
+                    hands.close()
+                except Exception:
+                    pass
+            if capture is not None:
+                try:
+                    capture.release()
+                except Exception:
+                    pass
 
 
 class GestureConfiguratorWindow(QMainWindow):
@@ -268,7 +281,7 @@ class GestureConfiguratorWindow(QMainWindow):
         self.setWindowTitle("GCSC Custom Gesture Configurator")
         self.resize(1180, 760)
 
-        self._preview = QLabel("Waiting for camera...")
+        self._preview = QLabel("Starting camera...")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setMinimumSize(600, 450)
         self._preview.setStyleSheet("background: #111; color: #ddd;")
@@ -529,6 +542,7 @@ class GestureConfiguratorWindow(QMainWindow):
         self._editor_dirty = True
 
     def _camera_error(self, message: str) -> None:
+        self._preview.setPixmap(QPixmap())
         self._preview.setText(message)
         self._record_button.setEnabled(False)
         self._test_button.setEnabled(False)

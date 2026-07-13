@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -109,7 +110,7 @@ class GestureConfigurationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "broken.json"
             path.write_text("{not json", encoding="utf-8")
-            with self.assertRaisesRegex(GestureConfigError, str(path)):
+            with self.assertRaisesRegex(GestureConfigError, re.escape(str(path))):
                 load_config(path)
 
     def test_saved_document_has_versioned_public_shape(self) -> None:

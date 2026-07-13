@@ -10,6 +10,7 @@ from typing import Iterable, Protocol
 
 import serial
 
+from tools.camera_support import create_hand_tracker, load_camera_dependencies
 from tools.controller import (
     BAUD_RATE,
     CONNECT_DELAY_SECONDS,
@@ -287,27 +288,20 @@ def run(
 ) -> None:
     config = load_config(config_path)
 
-    try:
-        import cv2
-        import mediapipe as mp
-    except ImportError as exc:
-        raise RuntimeError(
-            "MediaPipe gesture control requires mediapipe and OpenCV. "
-            "Install project dependencies with `uv sync`."
-        ) from exc
+    cv2, mp = load_camera_dependencies()
 
     capture = cv2.VideoCapture(camera)
     if not capture.isOpened():
+        capture.release()
         raise RuntimeError(f"could not open camera {camera}")
 
-    print(f"Opening {port} at {BAUD_RATE} baud...")
-    hands = mp.solutions.hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.5,
-    )
+    try:
+        hands = create_hand_tracker(mp)
+    except Exception:
+        capture.release()
+        raise
 
+    print(f"Opening {port} at {BAUD_RATE} baud...")
     last_command: str | None = None
     last_valid_gesture_at = time.monotonic()
 
