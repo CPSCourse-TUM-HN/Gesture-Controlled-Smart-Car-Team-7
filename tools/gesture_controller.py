@@ -5,6 +5,7 @@ import sys
 import time
 from dataclasses import dataclass
 from math import hypot
+from pathlib import Path
 from typing import Iterable, Protocol
 
 import serial
@@ -17,6 +18,18 @@ from tools.controller import (
     WRITE_TIMEOUT_SECONDS,
     is_disconnected,
 )
+from tools.custom_gestures import (
+    GestureMatch,
+    GestureTrigger,
+    find_matching_gesture,
+    normalize_landmarks,
+)
+from tools.gesture_config import (
+    ACTION_NAMES,
+    DEFAULT_CONFIG_PATH,
+    load_config,
+)
+from tools.gesture_sequence import ActionSequenceRunner
 
 WRIST = 0
 INDEX_MCP = 5
@@ -92,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         "--no-preview",
         action="store_true",
         help="disable the camera preview window",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help=f"gesture configuration file (default: {DEFAULT_CONFIG_PATH})",
     )
     return parser.parse_args()
 
@@ -211,7 +230,63 @@ def send_if_changed(
     return last_command
 
 
-def run(port: str, camera: int, lost_timeout: float, preview: bool) -> None:
+def handedness_label(results: object) -> str | None:
+    multi_handedness = getattr(results, "multi_handedness", None)
+    if not multi_handedness:
+        return None
+    classifications = multi_handedness[0].classification
+    if not classifications:
+        return None
+    label = classifications[0].label
+    return label if label in {"Left", "Right"} else None
+
+
+def draw_status(
+    frame: object,
+    cv2: object,
+    match: GestureMatch | None,
+    trigger: GestureTrigger,
+    sequence: ActionSequenceRunner,
+) -> None:
+    lines: list[str] = []
+    status = sequence.status
+    if status is not None:
+        lines.extend(
+            [
+                f"Custom: {status.gesture_name}",
+                (
+                    f"Step {status.step_number}/{status.step_count}: "
+                    f"{status.action_name}"
+                ),
+            ]
+        )
+    elif not trigger.armed:
+        lines.append("Release hand to re-arm")
+    elif match is not None:
+        lines.append(f"Custom: {match.gesture.name} (hold to trigger)")
+
+    for line_index, line in enumerate(lines):
+        cv2.putText(
+            frame,
+            line,
+            (16, 32 + line_index * 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (24, 220, 24),
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def run(
+    port: str,
+    camera: int,
+    lost_timeout: float,
+    preview: bool,
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+) -> None:
+    config = load_config(config_path)
+
     try:
         import cv2
         import mediapipe as mp
@@ -246,54 +321,111 @@ def run(port: str, camera: int, lost_timeout: float, preview: bool) -> None:
             time.sleep(CONNECT_DELAY_SECONDS)
             print_controls(preview)
             sender = CommandSender()
+            trigger = GestureTrigger()
+            sequence = ActionSequenceRunner(config.step_duration_seconds)
 
-            while True:
-                if is_disconnected(connection):
-                    raise serial.SerialException("serial port disconnected")
+            try:
+                while True:
+                    if is_disconnected(connection):
+                        raise serial.SerialException("serial port disconnected")
 
-                ok, frame = capture.read()
-                if not ok:
-                    raise RuntimeError("could not read from camera")
+                    ok, frame = capture.read()
+                    if not ok:
+                        raise RuntimeError("could not read from camera")
 
-                frame = cv2.flip(frame, 1)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = hands.process(rgb_frame)
-                state = None
+                    frame = cv2.flip(frame, 1)
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = hands.process(rgb_frame)
+                    state = None
+                    match = None
 
-                if results.multi_hand_landmarks:
-                    hand_landmarks = results.multi_hand_landmarks[0]
-                    state = classify_gesture(hand_landmarks.landmark)
+                    if results.multi_hand_landmarks:
+                        hand_landmarks = results.multi_hand_landmarks[0]
+                        state = classify_gesture(hand_landmarks.landmark)
+                        hand_label = handedness_label(results)
+                        if hand_label is not None and config.gestures:
+                            try:
+                                features = normalize_landmarks(
+                                    hand_landmarks.landmark
+                                )
+                            except ValueError:
+                                features = None
+                            if features is not None:
+                                match = find_matching_gesture(
+                                    features,
+                                    hand_label,
+                                    config.gestures,
+                                )
+                        if preview:
+                            mp.solutions.drawing_utils.draw_landmarks(
+                                frame,
+                                hand_landmarks,
+                                mp.solutions.hands.HAND_CONNECTIONS,
+                            )
+
+                    now = time.monotonic()
+                    is_emergency_stop = state is not None and state.command == "S"
+
+                    if is_emergency_stop:
+                        if sequence.active:
+                            sequence.cancel(connection, sender)
+                            print("emergency stop -> S")
+                        else:
+                            last_command = send_if_changed(
+                                connection,
+                                state,
+                                sender.last_command,
+                                sender,
+                            )
+                        trigger.update(None, now)
+                    elif sequence.active:
+                        trigger.update(match.gesture.id if match else None, now)
+                        sequence.tick(connection, sender, now)
+                    elif match is not None:
+                        triggered_id = trigger.update(match.gesture.id, now)
+                        if triggered_id is not None:
+                            sequence.start(match.gesture, now)
+                            sequence.tick(connection, sender, now)
+                            print(
+                                f"custom {match.gesture.name}: "
+                                + " -> ".join(
+                                    ACTION_NAMES[action]
+                                    for action in match.gesture.actions
+                                )
+                            )
+                    else:
+                        trigger.update(None, now)
+                        if state is not None:
+                            last_valid_gesture_at = now
+                            last_command = send_if_changed(
+                                connection,
+                                state,
+                                sender.last_command,
+                                sender,
+                            )
+                        elif now - last_valid_gesture_at >= lost_timeout:
+                            stop_state = GestureState("S", "stop")
+                            last_command = send_if_changed(
+                                connection,
+                                stop_state,
+                                sender.last_command,
+                                sender,
+                            )
+
+                    last_command = sender.last_command or last_command
+
                     if preview:
-                        mp.solutions.drawing_utils.draw_landmarks(
-                            frame,
-                            hand_landmarks,
-                            mp.solutions.hands.HAND_CONNECTIONS,
-                        )
-
-                if state is not None:
-                    last_valid_gesture_at = time.monotonic()
-                    last_command = send_if_changed(
-                        connection,
-                        state,
-                        last_command,
-                        sender,
-                    )
-                elif time.monotonic() - last_valid_gesture_at >= lost_timeout:
-                    stop_state = GestureState("S", "stop")
-                    last_command = send_if_changed(
-                        connection,
-                        stop_state,
-                        last_command,
-                        sender,
-                    )
-
-                if preview:
-                    cv2.imshow("GCSC Gesture Controller", frame)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in {27, ord("q")}:
-                        sender.send(connection, "S", force=True)
-                        print("\nSent stop.")
-                        return
+                        draw_status(frame, cv2, match, trigger, sequence)
+                        cv2.imshow("GCSC Gesture Controller", frame)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key in {27, ord("q")}:
+                            print("\nSent stop.")
+                            return
+            finally:
+                try:
+                    sender.send(connection, "S", force=True)
+                except serial.SerialException:
+                    pass
 
     finally:
         hands.close()
@@ -311,6 +443,7 @@ def main() -> int:
             camera=args.camera,
             lost_timeout=args.lost_timeout,
             preview=not args.no_preview,
+            config_path=args.config,
         )
         return 0
     except serial.SerialException as exc:
@@ -326,4 +459,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

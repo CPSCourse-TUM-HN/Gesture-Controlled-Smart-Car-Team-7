@@ -146,6 +146,43 @@ class CommandSenderTests(unittest.TestCase):
 
         self.assertEqual([call.args[1] for call in send.call_args_list], ["F", "S", "B"])
 
+    def test_nonblocking_movement_change_waits_across_calls(self) -> None:
+        clock = FakeClock()
+        sender = CommandSender(clock=clock, sleeper=clock.sleep)
+
+        with patch("tools.controller.send_command") as send:
+            self.assertTrue(sender.send_nonblocking("connection", "F"))
+            clock.now = 0.2
+            self.assertFalse(sender.send_nonblocking("connection", "L"))
+            self.assertEqual(clock.now, 0.2)
+            clock.now = 0.49
+            self.assertFalse(sender.send_nonblocking("connection", "L"))
+            clock.now = 0.5
+            self.assertTrue(sender.send_nonblocking("connection", "L"))
+
+        self.assertEqual(
+            [call.args[1] for call in send.call_args_list],
+            ["F", "S", "L"],
+        )
+
+    def test_synchronous_stop_cancels_pending_nonblocking_movement(self) -> None:
+        clock = FakeClock()
+        sender = CommandSender(clock=clock, sleeper=clock.sleep)
+
+        with patch("tools.controller.send_command") as send:
+            sender.send_nonblocking("connection", "F")
+            clock.now = 0.2
+            sender.send_nonblocking("connection", "L")
+            clock.now = 0.3
+            sender.send("connection", "S", force=True)
+            clock.now = 1.0
+            self.assertTrue(sender.send_nonblocking("connection", "S", force=True))
+
+        self.assertEqual(
+            [call.args[1] for call in send.call_args_list],
+            ["F", "S", "S", "S"],
+        )
+
     def test_forced_stop_inside_interval_waits_and_sends(self) -> None:
         clock = FakeClock()
         sender = CommandSender(clock=clock, sleeper=clock.sleep)

@@ -50,13 +50,21 @@ class CommandSender:
         reversal_stop_seconds: float = REVERSAL_STOP_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        command_writer: Callable[[object, str], None] | None = None,
     ) -> None:
         self._min_interval_seconds = min_interval_seconds
         self._reversal_stop_seconds = reversal_stop_seconds
         self._clock = clock
         self._sleeper = sleeper
+        self._command_writer = command_writer
         self._last_sent_at: float | None = None
         self._last_command: str | None = None
+        self._pending_command: str | None = None
+        self._pending_at: float | None = None
+
+    @property
+    def last_command(self) -> str | None:
+        return self._last_command
 
     def send(
         self,
@@ -65,6 +73,7 @@ class CommandSender:
         *,
         force: bool = False,
     ) -> bool:
+        self.cancel_pending()
         if command == self._last_command and not force:
             return False
 
@@ -84,6 +93,52 @@ class CommandSender:
         self._send_now(connection, command)
         return True
 
+    def send_nonblocking(
+        self,
+        connection: serial.Serial,
+        command: str,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Advance a command transition without sleeping.
+
+        A movement-to-movement change first sends stop and returns ``False``.
+        Repeated calls send the requested movement after the configured safety
+        delay and return ``True``. Duplicate commands count as ready without
+        being retransmitted so callers can use them as timed sequence steps.
+        """
+
+        if self._pending_command is not None:
+            if command != self._pending_command:
+                self.cancel_pending()
+            elif self._pending_at is not None and self._clock() >= self._pending_at:
+                self._send_now(connection, command)
+                self.cancel_pending()
+                return True
+            else:
+                return False
+
+        if command == self._last_command and not force:
+            return True
+
+        if self._is_movement_change(command) and not force:
+            if not self._can_send_now():
+                return False
+            self._send_now(connection, "S")
+            self._pending_command = command
+            self._pending_at = self._clock() + self._reversal_stop_seconds
+            return False
+
+        if not self._can_send_now():
+            return False
+
+        self._send_now(connection, command)
+        return True
+
+    def cancel_pending(self) -> None:
+        self._pending_command = None
+        self._pending_at = None
+
     def _is_movement_change(self, command: str) -> bool:
         return (
             command in MOVEMENT_COMMANDS
@@ -94,7 +149,10 @@ class CommandSender:
     def _can_send_now(self) -> bool:
         if self._last_sent_at is None:
             return True
-        return self._clock() - self._last_sent_at >= self._min_interval_seconds
+        return (
+            self._clock() - self._last_sent_at + 1e-9
+            >= self._min_interval_seconds
+        )
 
     def _wait_until_allowed(self) -> None:
         if self._last_sent_at is None:
@@ -106,7 +164,10 @@ class CommandSender:
             self._sleeper(remaining)
 
     def _send_now(self, connection: serial.Serial, command: str) -> None:
-        send_command(connection, command)
+        if self._command_writer is None:
+            send_command(connection, command)
+        else:
+            self._command_writer(connection, command)
         self._last_sent_at = self._clock()
         self._last_command = command
 

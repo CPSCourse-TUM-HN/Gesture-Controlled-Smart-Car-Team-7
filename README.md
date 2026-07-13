@@ -40,6 +40,8 @@ Vision processing and command scheduling run on the host computer. The ESP32 is 
 
 - Seven motion states: forward, backward, arc left, arc right, spin left, spin right, and stop.
 - Rule-based gesture classification using scale-tolerant landmark distance ratios and a directional dead zone.
+- Camera-recorded custom static gestures mapped to ordered motion sequences.
+- An English Qt desktop configurator for recording, arranging, and saving custom gestures.
 - Bluetooth Classic SPP communication through a one-byte application protocol.
 - Keyboard control for testing the Bluetooth, firmware, and mechanical subsystems without the camera.
 - Duplicate-command suppression and controlled transitions between movement commands.
@@ -69,7 +71,7 @@ The exact GPIO-to-motor assignment is defined in [`firmware/firmware.ino`](firmw
 - A host computer with a webcam and Bluetooth Classic SPP support
 - Optional: [mise](https://mise.jdx.dev/) and [direnv](https://direnv.net/) for the repository-managed development environment
 
-The Python environment installs MediaPipe, OpenCV, PySerial, JAX, and the remaining dependencies declared in [`pyproject.toml`](pyproject.toml). The repository's [`mise.toml`](mise.toml) selects Python 3.12, uv 0.11, and Arduino CLI 1.
+The Python environment installs MediaPipe, OpenCV, PySide6, PySerial, JAX, and the remaining dependencies declared in [`pyproject.toml`](pyproject.toml). The repository's [`mise.toml`](mise.toml) selects Python 3.12, uv 0.11, and Arduino CLI 1.
 
 ## Setup
 
@@ -146,6 +148,34 @@ uv run gcsc-controller --port <bluetooth-serial-device>
 | `x` or Space | Stop | `S` |
 | Escape or Ctrl-C | Stop and exit | `S` |
 
+### Custom gesture configurator
+
+Open the desktop configurator before starting the gesture controller:
+
+```sh
+uv run gcsc-gesture-configurator
+```
+
+Create or select a gesture, enter a unique name, and press **Record / Re-record Pose**. After a three-second countdown, hold one static hand pose until 30 consecutive valid frames have been captured. Add one or more actions, arrange them by dragging or with the move buttons, press **Save Gesture**, and then press **Save Configuration**.
+
+The available sequence actions are the seven motions already supported by the firmware:
+
+| Configurator action | Protocol byte |
+| --- | --- |
+| Forward | `F` |
+| Backward | `B` |
+| Steer Left | `L` |
+| Steer Right | `R` |
+| Spin Left | `A` |
+| Spin Right | `D` |
+| Stop | `S` |
+
+All steps share the configurable duration shown in the configurator. Consecutive copies of the same action extend that motion without retransmitting it. Every custom sequence ends with an automatic stop, whether or not Stop was added explicitly.
+
+By default, configuration is saved to `~/.gcsc/gesture-config.json`. Use `--config PATH` with both the configurator and gesture controller to use another file. Use `--camera INDEX` to select a different camera. The configurator never opens the Bluetooth connection and cannot move the car.
+
+The **Serial Output Test (Dry Run)** panel validates a saved custom gesture without moving the car. Start the test, show a recorded pose to the camera, and inspect each byte the real command pipeline would write to Bluetooth. The log includes safety stops inserted between different movements and the final automatic stop. For example, a Forward → Steer Left sequence produces `F`, `S`, `L`, `S`. The panel deliberately uses an in-memory serial recorder because the current Bluetooth protocol has no acknowledgement or telemetry with which to confirm reception from the vehicle.
+
 ### Gesture controller
 
 Run the camera-based controller with:
@@ -155,6 +185,7 @@ uv run gcsc-gesture-controller --port <bluetooth-serial-device>
 ```
 
 The preview image is mirrored so that left and right gestures feel natural to the operator.
+If a custom configuration exists, a recorded pose takes priority over the ordinary movement gestures. Hold it steadily for 0.4 seconds to start its sequence. It will not trigger again until no custom pose has matched for at least 0.3 seconds. The fist remains a reserved emergency stop and cannot be recorded as a custom gesture.
 
 | Observed hand pose | Action | Protocol byte |
 | --- | --- | --- |
@@ -177,6 +208,7 @@ Available options:
 | `--camera INDEX` | Select the webcam; the default index is `0` |
 | `--lost-timeout SECONDS` | Set the delay before an invalid or missing gesture sends stop; the default is `0.5` |
 | `--no-preview` | Disable the OpenCV preview window |
+| `--config PATH` | Load custom gestures from this file; the default is `~/.gcsc/gesture-config.json` |
 
 ## Communication Protocol
 
@@ -202,6 +234,7 @@ The controllers implement several safeguards:
 - Transmissions are separated by a minimum interval of 0.2 seconds.
 - A change from one movement command to another sends `S`, waits 0.3 seconds, and then sends the new command.
 - The gesture controller sends `S` after the lost-gesture timeout expires.
+- A custom action sequence sends `S` when it completes or is cancelled; ordinary gestures are ignored while it runs, except for the fist emergency stop.
 - Escape or Ctrl-C in the keyboard controller and `q` or Escape in the gesture preview send an explicit stop before exit.
 - Serial disconnection and incomplete-write conditions are reported as errors.
 
@@ -215,7 +248,7 @@ Run the host-side unit tests from the repository root:
 uv run python -m unittest discover -s tests
 ```
 
-The current suite contains 29 tests covering pointing gestures, open-palm spins, fist stop, invalid landmarks, duplicate suppression, stopped motion transitions, command timing, and serial-write errors. These tests verify deterministic software behavior; they do not measure physical gesture accuracy, Bluetooth range, end-to-end latency, motor current, steering symmetry, or stopping distance.
+The suite contains 54 tests covering pointing gestures, open-palm spins, fist stop, custom-template normalization and matching, trigger timing, configuration validation, action sequencing, end-to-end custom-gesture serial traces, duplicate suppression, stopped motion transitions, command timing, the Qt sequence editor, and serial-write errors. These tests verify deterministic software behavior; they do not measure physical gesture accuracy, Bluetooth range, end-to-end latency, motor current, steering symmetry, or stopping distance.
 
 ## Repository Structure
 
@@ -224,6 +257,11 @@ The current suite contains 29 tests covering pointing gestures, open-palm spins,
 | [`firmware/`](firmware/) | ESP32 firmware and build/upload instructions |
 | [`tools/controller.py`](tools/controller.py) | Keyboard controller and shared serial command scheduler |
 | [`tools/gesture_controller.py`](tools/gesture_controller.py) | Webcam capture, MediaPipe processing, and gesture classification |
+| [`tools/gesture_configurator.py`](tools/gesture_configurator.py) | Qt desktop UI for recording gestures and arranging action sequences |
+| [`tools/gesture_config.py`](tools/gesture_config.py) | Versioned custom-gesture configuration model and persistence |
+| [`tools/custom_gestures.py`](tools/custom_gestures.py) | Landmark normalization, template matching, and trigger state |
+| [`tools/gesture_sequence.py`](tools/gesture_sequence.py) | Timed custom action-sequence execution |
+| [`tools/gesture_serial_test.py`](tools/gesture_serial_test.py) | Safe in-memory tester for gesture-to-Bluetooth output bytes |
 | [`tests/`](tests/) | Host-side unit tests |
 | [`doc/`](doc/) | Technical report, presentation, and demonstration video |
 | [`pyproject.toml`](pyproject.toml) | Python package metadata, dependencies, and command-line entry points |
